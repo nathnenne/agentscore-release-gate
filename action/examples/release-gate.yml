@@ -1,0 +1,38 @@
+# Example workflow that drops the AgentScore release-gate action into
+# your repo. Copy this to `.github/workflows/release-gate.yml`.
+#
+# What it does on every PR to main:
+#   • runs the agentscore CLI against the configured suite;
+#   • uploads the JSON artifact;
+#   • posts (or updates) a single sticky PR comment with the verdict;
+#   • fails the workflow when the configured gate fails.
+#
+# Prerequisites:
+#   • repository secret `AGENTSCORE_TOKEN` — Clerk JWT minted from the
+#     `agentscore_api` template;
+#   • repository variable `AGENTSCORE_SUITE_ID` — the v2 suite UUID to
+#     evaluate.
+
+name: AgentScore release gate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write   # required for the sticky comment via ${{ github.token }}
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: nathnenne/agentscore-release-gate/action@v1   # or pin to a commit SHA
+        with:
+          suite-id: ${{ vars.AGENTSCORE_SUITE_ID }}
+          gate: baseline-agent-v1
+          fail-on: BLOCKED,NEEDS_FIXES,LOW_CONFIDENCE_CRITICAL
+        env:
+          AGENTSCORE_TOKEN: ${{ secrets.AGENTSCORE_TOKEN }}

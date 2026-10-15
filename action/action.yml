@@ -1,0 +1,377 @@
+# TSK_124 + TSK_157 — AgentScore release-gate composite action.
+#
+# Thin wrapper around the agentscore CLI shipped in /cli of this repo. The
+# action installs the CLI at the same git ref it was invoked from, runs
+# `agentscore release-gate`, uploads the JSON artifact, and posts (or
+# updates) a single sticky PR comment summarising the verdict.
+#
+# Security posture (TSK_157, closes RES_154 P0 #3 — GitHub Actions
+# script injection):
+#   - NO `${{ inputs.* }}` expression lives inside a `run:` shell or
+#     Python body. Every input flows through a step-level `env:` block
+#     and the script reads it as a *quoted* environment variable. This
+#     is GitHub Security's published "use env to pass actor data" pattern.
+#   - The first step runs `python action/validate_inputs.py`, which is an
+#     allow-list validator over every action input. A workflow that
+#     ferries PR-author-controlled metadata into an input cannot reach
+#     any subsequent step until the value matches its regex / enum.
+#   - Inline `python -c '...'` was replaced with `action/extract_gate_outputs.py`,
+#     a checked-in script that reads the artifact path from
+#     AGENTSCORE_ARTIFACT_PATH and writes a closed allow-list verdict +
+#     confidence to GITHUB_OUTPUT.
+#
+# Token handling:
+#   * `AGENTSCORE_TOKEN` flows in via env (caller maps secrets.AGENTSCORE_TOKEN
+#     to env on the step that uses this action).
+#   * The CLI's _scrub() already strips secret-shaped substrings from any
+#     error message; this action additionally avoids `echo` of the token
+#     anywhere and never writes it to outputs / summaries / comments.
+#   * `${{ github.token }}` is used for the PR-comment write (built into
+#     every workflow run; no extra setup).
+#
+# Recommended caller `permissions:`
+#   contents: read
+#   pull-requests: write   # ONLY if comment-on-pr is true on a pull_request
+#   # Do NOT add `actions: write` or `id-token: write` — neither is needed.
+
+name: 'AgentScore release gate'
+description: |
+  Block risky AI-agent PRs with evidence-backed release decisions. Wraps the
+  agentscore release-gate CLI, uploads the JSON artifact, and posts a sticky
+  PR comment with the verdict + top blockers.
+author: 'AgentScore'
+
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  suite-id:
+    description: 'v2 suite UUID to evaluate (an already finished run). Set this OR agent-id.'
+    required: false
+    default: ''
+  agent-id:
+    description: |
+      Bot UUID. Starts a full gate run for it, waits for the result, then
+      evaluates that run. Set this OR suite-id. Authenticate with an API key
+      (AGENTSCORE_TOKEN = ags_key_…, Settings → API keys).
+    required: false
+    default: ''
+  run-key:
+    description: |
+      Idempotency key for agent-id runs; defaults to the commit SHA so a
+      re-run job reuses its run instead of paying twice. [A-Za-z0-9._:-]{1,128}.
+    required: false
+    default: ''
+  gate:
+    description: 'Gate template id (must exist in /v2/evaluations/gates/registry).'
+    required: false
+    default: 'baseline-agent-v1'
+  fail-on:
+    description: |
+      Comma-separated fail signals. Allowed:
+      BLOCKED, NEEDS_FIXES, REVIEW_REQUIRED, LOW_CONFIDENCE_CRITICAL.
+    required: false
+    default: 'BLOCKED,NEEDS_FIXES,LOW_CONFIDENCE_CRITICAL'
+  api-url:
+    description: 'Backend API base URL. Must be https:// unless allow-http-local is true.'
+    required: false
+    default: 'https://api.agentscore.tech'
+  python-version:
+    description: 'Python version used to install + run the CLI. Digits and dots only (e.g. 3.12, 3.12.4).'
+    required: false
+    default: '3.12'
+  artifact-name:
+    description: |
+      Name for the uploaded JSON artifact (and the local filename root).
+      Safe file stem: ^[A-Za-z0-9_.-]{1,80}$ (no /, no whitespace,
+      no $, no backticks, no semicolons).
+    required: false
+    default: 'agentscore-release-decision'
+  integration-artifact-name:
+    description: |
+      Name for the uploaded integration artifact bundle (CloudEvents JSON + SARIF).
+      Same safe-file-stem contract as artifact-name.
+    required: false
+    default: 'agentscore-release-integrations'
+  comment-on-pr:
+    description: |
+      Exactly "true" or "false". "true" to post/update a sticky PR comment
+      when triggered on a pull_request event.
+    required: false
+    default: 'true'
+  fail-workflow-on-gate:
+    description: |
+      Exactly "true" or "false". "true" propagates the CLI's non-zero
+      exit to the workflow ("fail"). "false" leaves the workflow green
+      but still uploads the artifact + posts the comment (useful for
+      soft rollouts).
+    required: false
+    default: 'true'
+  allow-http-local:
+    description: |
+      OPT-IN test flag. Exactly "true" or "false". When "true",
+      api-url may be http://localhost / http://127.0.0.1 / http://[::1]
+      for local CI / examples. Default is "false" — the published
+      action only accepts https URLs.
+    required: false
+    default: 'false'
+
+outputs:
+  verdict:
+    description: 'The release verdict (BLOCKED / NEEDS_FIXES / REVIEW_REQUIRED / RELEASE_CANDIDATE / UNKNOWN).'
+    value: ${{ steps.outputs.outputs.verdict }}
+  confidence:
+    description: 'LOW / MEDIUM / HIGH / UNKNOWN.'
+    value: ${{ steps.outputs.outputs.confidence }}
+  exit-code:
+    description: 'CLI exit code (0 / 1 / 2).'
+    value: ${{ steps.gate.outputs.exit_code }}
+  artifact-path:
+    description: 'Path to the JSON artifact written on disk.'
+    value: ${{ steps.gate.outputs.artifact_path }}
+  event-path:
+    description: 'Path to the CloudEvents-compatible event JSON written on disk.'
+    value: ${{ steps.gate.outputs.event_path }}
+  sarif-path:
+    description: 'Path to the SARIF 2.1.0 file written on disk.'
+    value: ${{ steps.gate.outputs.sarif_path }}
+
+runs:
+  using: composite
+  steps:
+    # ---------------------------------------------------------------- #
+    # 1. Validate every action input against an allow-list BEFORE any  #
+    #    subsequent step runs. Inputs flow only through env vars; the  #
+    #    validator never sees an expression-expanded string.           #
+    # ---------------------------------------------------------------- #
+    - name: Validate inputs
+      shell: bash
+      env:
+        INPUT_SUITE_ID: ${{ inputs.suite-id }}
+        INPUT_AGENT_ID: ${{ inputs.agent-id }}
+        INPUT_RUN_KEY: ${{ inputs.run-key }}
+        INPUT_GATE: ${{ inputs.gate }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_API_URL: ${{ inputs.api-url }}
+        INPUT_PYTHON_VERSION: ${{ inputs.python-version }}
+        INPUT_ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        INPUT_INTEGRATION_ARTIFACT_NAME: ${{ inputs.integration-artifact-name }}
+        INPUT_COMMENT_ON_PR: ${{ inputs.comment-on-pr }}
+        INPUT_FAIL_WORKFLOW_ON_GATE: ${{ inputs.fail-workflow-on-gate }}
+        INPUT_ALLOW_HTTP_LOCAL: ${{ inputs.allow-http-local }}
+        _ACTION_DIR: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        python "${_ACTION_DIR}/validate_inputs.py"
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        # `python-version` is the only ${{ inputs.* }} we let into a
+        # `with:` block. The validator above already enforced that the
+        # value matches ^[0-9]+(\.[0-9]+){0,2}$ — no shell, no Python,
+        # no further interpolation surface.
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install agentscore CLI from this action's repo ref
+      shell: bash
+      env:
+        # No secrets here — only PATH + a local source dir.
+        _CLI_DIR: ${{ github.action_path }}/../cli
+      run: |
+        set -euo pipefail
+        if [ ! -f "${_CLI_DIR}/pyproject.toml" ]; then
+          echo "::error::Could not locate agentscore CLI at ${_CLI_DIR}." >&2
+          exit 2
+        fi
+        python -m pip install --upgrade pip >/dev/null
+        python -m pip install "${_CLI_DIR}"
+        agentscore --version
+
+    # ---------------------------------------------------------------- #
+    # 2. Run the gate. All five user-controlled inputs flow through    #
+    #    AGENTSCORE_* env vars and are read as quoted shell variables. #
+    # ---------------------------------------------------------------- #
+    - name: Run agentscore release-gate
+      id: gate
+      shell: bash
+      env:
+        AGENTSCORE_TOKEN: ${{ env.AGENTSCORE_TOKEN }}
+        AGENTSCORE_SUITE_ID: ${{ inputs.suite-id }}
+        AGENTSCORE_AGENT_ID: ${{ inputs.agent-id }}
+        AGENTSCORE_RUN_KEY: ${{ inputs.run-key }}
+        AGENTSCORE_GATE: ${{ inputs.gate }}
+        AGENTSCORE_API_URL: ${{ inputs.api-url }}
+        AGENTSCORE_FAIL_ON: ${{ inputs.fail-on }}
+        AGENTSCORE_ARTIFACT_NAME: ${{ inputs.artifact-name }}
+      run: |
+        set +e
+        artifact="${AGENTSCORE_ARTIFACT_NAME}.json"
+        event="${AGENTSCORE_ARTIFACT_NAME}.event.json"
+        sarif="${AGENTSCORE_ARTIFACT_NAME}.sarif"
+        # TSK_1065 — read a finished run, or start one and wait for it.
+        if [ -n "${AGENTSCORE_AGENT_ID}" ]; then
+          target=(--agent "${AGENTSCORE_AGENT_ID}" --run-key "${AGENTSCORE_RUN_KEY:-${GITHUB_SHA}}")
+        else
+          target=(--suite "${AGENTSCORE_SUITE_ID}")
+        fi
+        agentscore release-gate \
+          "${target[@]}" \
+          --gate "${AGENTSCORE_GATE}" \
+          --api-url "${AGENTSCORE_API_URL}" \
+          --fail-on "${AGENTSCORE_FAIL_ON}" \
+          --output "${artifact}" \
+          --event-output "${event}" \
+          --sarif-output "${sarif}"
+        code=$?
+        set -e
+        {
+          echo "exit_code=${code}"
+          echo "artifact_path=${artifact}"
+          echo "event_path=${event}"
+          echo "sarif_path=${sarif}"
+        } >> "${GITHUB_OUTPUT}"
+
+    # ---------------------------------------------------------------- #
+    # 3. Extract verdict + confidence via a checked-in helper. The     #
+    #    artifact path flows through AGENTSCORE_ARTIFACT_PATH; the     #
+    #    helper never sees an expression-expanded string.              #
+    # ---------------------------------------------------------------- #
+    - name: Extract verdict + confidence outputs
+      id: outputs
+      if: always()
+      shell: bash
+      env:
+        AGENTSCORE_ARTIFACT_PATH: ${{ steps.gate.outputs.artifact_path }}
+        _ACTION_DIR: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        python "${_ACTION_DIR}/extract_gate_outputs.py"
+
+    - name: Upload JSON artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ steps.gate.outputs.artifact_path }}
+        if-no-files-found: warn
+
+    - name: Upload integration artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.integration-artifact-name }}
+        path: |
+          ${{ steps.gate.outputs.event_path }}
+          ${{ steps.gate.outputs.sarif_path }}
+        if-no-files-found: warn
+
+    # ---------------------------------------------------------------- #
+    # 4. Render PR-comment markdown. The renderer is a checked-in      #
+    #    helper invoked with --artifact and --gate as separate argv    #
+    #    tokens; no `${{ inputs.* }}` is composed into a shell body.   #
+    #    The action path is read from an env var so the path itself    #
+    #    cannot be poisoned by an upstream string.                      #
+    # ---------------------------------------------------------------- #
+    - name: Render PR-comment markdown
+      id: render
+      if: always() && inputs.comment-on-pr == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        AGENTSCORE_ARTIFACT_PATH: ${{ steps.gate.outputs.artifact_path }}
+        AGENTSCORE_GATE: ${{ inputs.gate }}
+        _ACTION_DIR: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        if [ ! -f "${AGENTSCORE_ARTIFACT_PATH}" ]; then
+          echo "::warning::No artifact written; skipping PR comment." >&2
+          exit 0
+        fi
+        body=$(python "${_ACTION_DIR}/render_pr_comment.py" \
+          --artifact "${AGENTSCORE_ARTIFACT_PATH}" \
+          --gate "${AGENTSCORE_GATE}")
+        # Use the runner's $RANDOM for the delimiter — deterministic
+        # enough for a single step, and no Python invocation required.
+        delimiter="AGENTSCORE_COMMENT_${RANDOM}_${RANDOM}"
+        {
+          echo "body<<${delimiter}"
+          echo "${body}"
+          echo "${delimiter}"
+        } >> "${GITHUB_OUTPUT}"
+
+    - name: Write GitHub Step Summary
+      if: always() && steps.gate.outputs.artifact_path != ''
+      shell: bash
+      env:
+        AGENTSCORE_ARTIFACT_PATH: ${{ steps.gate.outputs.artifact_path }}
+        AGENTSCORE_GATE: ${{ inputs.gate }}
+        _ACTION_DIR: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        if [ -z "${GITHUB_STEP_SUMMARY:-}" ]; then
+          exit 0
+        fi
+        if [ ! -f "${AGENTSCORE_ARTIFACT_PATH}" ]; then
+          {
+            echo "## AgentScore release gate"
+            echo
+            echo "No AgentScore artifact was written."
+          } >> "${GITHUB_STEP_SUMMARY}"
+          exit 0
+        fi
+        python "${_ACTION_DIR}/render_pr_comment.py" \
+          --artifact "${AGENTSCORE_ARTIFACT_PATH}" \
+          --gate "${AGENTSCORE_GATE}" \
+          --format step-summary >> "${GITHUB_STEP_SUMMARY}"
+
+    - name: Post or update sticky PR comment
+      if: always() && inputs.comment-on-pr == 'true' && github.event_name == 'pull_request' && steps.render.outputs.body != ''
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ github.token }}
+        script: |
+          const marker = '<!-- agentscore-release-gate-comment-marker -->';
+          const body = `${marker}\n${process.env.AGENTSCORE_COMMENT_BODY}`;
+          const { owner, repo } = context.repo;
+          const issue_number = context.issue.number;
+          const { data: comments } = await github.rest.issues.listComments({
+            owner, repo, issue_number, per_page: 100,
+          });
+          const existing = comments.find((c) => (c.body || '').includes(marker));
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner, repo, comment_id: existing.id, body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner, repo, issue_number, body,
+            });
+          }
+      env:
+        AGENTSCORE_COMMENT_BODY: ${{ steps.render.outputs.body }}
+
+    # ---------------------------------------------------------------- #
+    # 5. Propagate the gate exit code. The CLI's integer exit lives in #
+    #    AGENTSCORE_EXIT_CODE; the verdict / fail-workflow-on-gate     #
+    #    flags ride env vars so no shell body interpolates an input.   #
+    # ---------------------------------------------------------------- #
+    - name: Propagate gate exit code
+      shell: bash
+      env:
+        AGENTSCORE_EXIT_CODE: ${{ steps.gate.outputs.exit_code }}
+        AGENTSCORE_VERDICT: ${{ steps.outputs.outputs.verdict }}
+        AGENTSCORE_FAIL_WORKFLOW: ${{ inputs.fail-workflow-on-gate }}
+      run: |
+        set -euo pipefail
+        code="${AGENTSCORE_EXIT_CODE}"
+        if [ "${code}" = "0" ]; then
+          echo "AgentScore release gate: PASSED (verdict=${AGENTSCORE_VERDICT})."
+          exit 0
+        fi
+        if [ "${AGENTSCORE_FAIL_WORKFLOW}" != "true" ]; then
+          echo "::warning::AgentScore release gate exited ${code} (verdict=${AGENTSCORE_VERDICT}); not failing workflow per fail-workflow-on-gate=false."
+          exit 0
+        fi
+        echo "::error::AgentScore release gate exited ${code} (verdict=${AGENTSCORE_VERDICT})." >&2
+        exit "${code}"
